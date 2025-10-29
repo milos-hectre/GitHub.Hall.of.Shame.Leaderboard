@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Leaderboard</title>
+  <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #121212;
+        color: #ffffff;
+      }
+      h1 {
+        text-align: center;
+        color: #ffffff;
+      }
+      #pat-section {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+      #org, #pat {
+        width: 300px;
+        padding: 8px;
+        margin-bottom: 10px;
+        background-color: #333;
+        color: #fff;
+        border: 1px solid #555;
+      }
+      button {
+        padding: 8px 16px;
+        background-color: #007bff;
+        color: white;
+        border: none;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      #loading {
+        display: none;
+        text-align: center;
+        font-size: 18px;
+        margin: 60px 0 20px 0;
+      }
+      .spinner {
+        border: 4px solid #f3f3f3;
+        border-top: 4px solid #007bff;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto 20px auto;
+      }
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      #points-system {
+        text-align: center;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 20px;
+        background-color: #1e1e1e;
+      }
+      th, td {
+        border: 1px solid #333;
+        padding: 12px;
+        text-align: left;
+      }
+      th {
+        background-color: #333;
+        color: #fff;
+      }
+      tr:nth-child(even) {
+        background-color: #2a2a2a;
+      }
+      tr:hover {
+        background-color: #3a3a3a;
+        cursor: pointer;
+      }
+      .items {
+        display: none;
+        background-color: #222;
+        padding: 10px;
+        margin-top: 5px;
+      }
+      .items a {
+        color: #007bff;
+        text-decoration: none;
+        margin-bottom: 5px;
+      }
+      .items a:hover {
+        text-decoration: underline;
+      }
+  </style>
+</head>
+<body>
+  <h1>GitHub Leaderboard</h1>
+  <div id="pat-section">
+      <input type="text" id="org" placeholder="Enter GitHub Organization">
+      <input type="password" id="pat" placeholder="Enter GitHub Personal Access Token">
+      <button onclick="loadLeaderboard()">Load Leaderboard</button>
+  </div>
+  <div id="loading">
+      <div class="spinner"></div>
+      Loading...
+  </div>
+  <div id="leaderboard"></div>
+
+  <script>
+    async function processMessage(e) {
+      const org = e.data.org;
+      const pat = e.data.pat;
+      const headers = {
+        Authorization: `token ${pat}`,
+        'User-Agent': 'GitHub-Leaderboard'
+      };
+
+      try {
+        const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+
+        // Get all repos of org
+        postMessage({type: 'progress', message: 'Fetching repositories'});
+        const allRepos = [];
+        let page = 1;
+        while (true) {
+          const reposResponse = await fetch(`https://api.github.com/orgs/${org}/repos?per_page=100&page=${page}`, { headers });
+          if (!reposResponse.ok) {
+            throw new Error(`Failed to fetch repos: ${reposResponse.status}`);
+          }
+          const reposPage = await reposResponse.json();
+          allRepos.push(...reposPage);
+          if (reposPage.length < 100) break;
+          page++;
+        }
+
+        // Get all members of org
+        postMessage({type: 'progress', message: 'Fetching organization members'});
+        const membersResponse = await fetch(`https://api.github.com/orgs/${org}/members`, { headers });
+        if (!membersResponse.ok) {
+          throw new Error(`Failed to fetch members: ${membersResponse.status}`);
+        }
+        const members = await membersResponse.json();
+        const allowedUsers = new Set(members.map(m => m.login));
+
+        const leaderboard = new Map();
+
+        // Function to process a single repository
+        async function processRepo(repo) {
+          const repoName = repo.name;
+          const defaultBranch = repo.default_branch;
+
+          if (repo.archived) {
+            return; // Skip archived repos
+          }
+
+          // Parallel fetch PRs and branches
+          const [prsResponse, branchesResponse] = await Promise.all([
+            fetch(`https://api.github.com/repos/${org}/${repoName}/pulls?state=all`, { headers }),
+            fetch(`https://api.github.com/repos/${org}/${repoName}/branches`, { headers })
+          ]);
+
+          // Process PRs
+          let prBranches = new Set();
+          if (prsResponse.ok) {
+            const prs = await prsResponse.json();
+            prBranches = new Set(prs.map(pr => pr.head.ref));
+            for (const pr of prs) {
+              if (pr.state !== 'open') continue; // Only score open PRs
+              if (new Date(pr.created_at) >= twoWeeksAgo) continue; // Only include PRs open for more than 2 weeks
+              const author = pr.user.login;
+              if (allowedUsers.has(author)) {
+                if (!leaderboard.has(author)) {
+                  leaderboard.set(author, { author, points: 0, items: [] });
+                }
+                const entry = leaderboard.get(author);
+                entry.points += 2;
+                entry.items.push({ type: 'pr', url: pr.html_url, title: pr.title, repo: repoName });
+              }
+            }
+          }
+
+          // Process branches in parallel
+          if (branchesResponse.ok) {
+            const branches = await branchesResponse.json();
+            const validBranches = branches.filter(branch => 
+              branch.name !== defaultBranch && 
+              !branch.name.endsWith('_pod') && 
+              !branch.name.startsWith('release/') &&
+              !prBranches.has(branch.name)
+            );
+            
+            // Parallel fetch all compare data
+            const comparePromises = validBranches.map(branch => 
+              fetch(`https://api.github.com/repos/${org}/${repoName}/compare/${defaultBranch}...${branch.name}`, { headers })
+                .then(response => response.ok ? response.json() : null)
+            );
+            
+            const compareResults = await Promise.all(comparePromises);
+            
+            for (let j = 0; j < validBranches.length; j++) {
+              const branch = validBranches[j];
+              const compareData = compareResults[j];
+              if (compareData && compareData.commits && compareData.commits.length > 0) {
+                const latestCommit = compareData.commits[compareData.commits.length - 1];
+                if (new Date(latestCommit.commit.committer.date) >= twoWeeksAgo) continue; // Only include if no commits in last 2 weeks
+                const author = latestCommit.author?.login || latestCommit.committer?.login;
+                if (author && allowedUsers.has(author)) {
+                  if (!leaderboard.has(author)) {
+                    leaderboard.set(author, { author, points: 0, items: [] });
+                  }
+                  const entry = leaderboard.get(author);
+                  entry.points += 1;
+                  entry.items.push({ type: 'branch', url: `https://github.com/${org}/${repoName}/tree/${branch.name}`, name: branch.name, repo: repoName });
+                }
+              }
+            }
+          }
+        }
+
+        // Process repositories in batches of 10
+        const batchSize = 10;
+        for (let i = 0; i < allRepos.length; i += batchSize) {
+          const batch = allRepos.slice(i, i + batchSize);
+          postMessage({type: 'progress', message: `Processing repositories (batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(allRepos.length / batchSize)})`});
+          await Promise.all(batch.map(repo => processRepo(repo)));
+        }
+
+        postMessage({type: 'progress', message: 'Sorting and displaying results'});
+
+        // Sort leaderboard by points ascending
+        const sortedLeaderboard = Array.from(leaderboard.values()).sort((a, b) => a.points - b.points);
+
+        // Sort items within each entry: branches first, then PRs, alphabetically by URL
+        for (const entry of sortedLeaderboard) {
+          entry.items.sort((a, b) => {
+            if (a.type === 'branch' && b.type === 'pr') return -1;
+            if (a.type === 'pr' && b.type === 'branch') return 1;
+            return a.url.localeCompare(b.url);
+          });
+        }
+
+        postMessage({type: 'result', leaderboard: sortedLeaderboard});
+      } catch (error) {
+        postMessage({type: 'error', message: error.message});
+      }
+    }
+
+    async function loadLeaderboard() {
+      const org = document.getElementById('org').value;
+      const pat = document.getElementById('pat').value;
+      if (!org) {
+        alert('Please enter a GitHub Organization');
+        return;
+      }
+      if (!pat) {
+        alert('Please enter a GitHub Personal Access Token');
+        return;
+      }
+      document.getElementById('pat-section').style.display = 'none';
+      document.getElementById('loading').style.display = 'block';
+      document.getElementById('leaderboard').innerHTML = '';
+
+      const workerCode = `
+        ${processMessage.toString()}
+        onmessage = processMessage;
+      `;
+
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const worker = new Worker(URL.createObjectURL(blob));
+
+      worker.postMessage({ org, pat });
+
+      worker.onmessage = function(e) {
+        if (e.data.type === 'progress') {
+          document.getElementById('loading').innerHTML = '<div class="spinner"></div><br>' + e.data.message;
+        } else if (e.data.type === 'result') {
+          document.getElementById('loading').style.display = 'none';
+          displayLeaderboard(e.data.leaderboard);
+          worker.terminate();
+        } else if (e.data.type === 'error') {
+          document.getElementById('loading').style.display = 'none';
+          alert('Error loading leaderboard: ' + e.data.message);
+          document.getElementById('pat-section').style.display = 'flex';
+          worker.terminate();
+        }
+      };
+
+      worker.onerror = function(error) {
+        document.getElementById('loading').style.display = 'none';
+        alert('Worker error: ' + error.message);
+        document.getElementById('pat-section').style.display = 'flex';
+        worker.terminate();
+      };
+    }
+
+    function displayLeaderboard(leaderboard) {
+      if (!leaderboard || leaderboard.length === 0) {
+        document.getElementById('leaderboard').innerHTML = '<p>No data available.</p>';
+        return;
+      }
+
+      let html = '<div id="points-system"><strong>1 point</strong> for each open branch older than 2 weeks';
+      html += '<br><strong>2 points</strong> for each open PR older than 2 weeks';
+      html += '<br><br>Archived repositories are excluded';
+      html += '</div><table>';
+      html += '<thead><tr><th>Author</th><th>Points</th></tr></thead>';
+      html += '<tbody>';
+
+      for (let i = 0; i < leaderboard.length; i++) {
+        const entry = leaderboard[i];
+        html += `<tr onclick="toggleItems(${i})"><td>${entry.author}</td><td>${entry.points}</td></tr>`;
+        html += `<tr id="items-${i}" class="items"><td colspan="2">`;
+        if (entry.items && entry.items.length > 0) {
+          for (const item of entry.items) {
+            html += `<span>${item.type} | <a href="${item.url}" target="_blank">${item.repo}: ${item.title || item.name}</a></span><br>`;
+          }
+        } else {
+          html += 'None';
+        }
+        html += '</td></tr>';
+      }
+
+      html += '</tbody></table>';
+      document.getElementById('leaderboard').innerHTML = html;
+    }
+
+    function toggleItems(index) {
+      const itemsRow = document.getElementById(`items-${index}`);
+      itemsRow.style.display = itemsRow.style.display === 'table-row' ? 'none' : 'table-row';
+    }
+  </script>
+</body>
+</html>
